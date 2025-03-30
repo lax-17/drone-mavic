@@ -1,4 +1,4 @@
-from controller import Robot, GPS, InertialUnit, Gyro, Motor, Keyboard
+from controller import Robot, GPS, InertialUnit, Gyro, Motor
 import cv2
 import numpy as np
 
@@ -13,8 +13,6 @@ TARGET_ALTITUDE = 1.0
 
 # Initialize robot and devices
 robot = Robot()
-keyboard = Keyboard()
-keyboard.enable(TIME_STEP)
 
 gps = robot.getDevice("drone_gps")
 gps.enable(TIME_STEP)
