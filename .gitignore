@@ -1,0 +1,19 @@
+# Webots cache and temp
+*.bak
+*.wbo
+*.tmp
+*.class
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS metadata
+.DS_Store
+
+# OpenCV temp files
+*.png
