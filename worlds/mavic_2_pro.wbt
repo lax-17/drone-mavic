@@ -93,6 +93,14 @@ CardboardBox {
 TeslaModel3Simple {
   translation -41.5139 4.34169 0.31
   rotation 0 0 1 -0.2618053071795865
+  controller "car_controller"
+  sensorsSlotTop [
+    Emitter {
+      channel 1
+    }
+    GPS {
+    }
+  ]
 }
 Pine {
   translation -14.0083 -14.4828 0
@@ -152,6 +160,9 @@ Robot {
   translation 0.005307539388070659 -2.811210383678084e-08 0.08570872787430539
   rotation 0.034863928111084644 6.510931954065678e-07 0.9993920684677466 -3.1415873782344224
   children [
+    Receiver {
+      channel 1
+    }
     InertialUnit {
       name "drone_imu"
     }
