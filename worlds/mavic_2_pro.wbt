@@ -27,8 +27,8 @@ WorldInfo {
   }
 }
 Viewpoint {
-  orientation -0.03132509357312057 -0.004229724205027985 0.9995002991224087 2.901671340011777
-  position 3.394164378270753 -0.9278454391776105 0.7459206714871298
+  orientation -0.05906789768706307 -0.07472887194092975 -0.9954529517567703 0.9910714693936131
+  position -0.7074573372857996 1.184412278754691 0.11702850485081173
   near 0.2
   follow "Mavic 2 PRO"
   followSmoothness 0.2
@@ -93,7 +93,6 @@ CardboardBox {
 TeslaModel3Simple {
   translation -41.5139 4.34169 0.31
   rotation 0 0 1 -0.2618053071795865
-  controller "car_controller"
   sensorsSlotTop [
     Emitter {
       channel 1
@@ -157,9 +156,17 @@ Forest {
   minRadius 3
 }
 Robot {
-  translation 0.005307539388070659 -2.811210383678084e-08 0.08570872787430539
+  translation 0 0 0.1
   rotation 0.034863928111084644 6.510931954065678e-07 0.9993920684677466 -3.1415873782344224
   children [
+    Camera {
+      translation 0 0 -0.05
+      rotation 0 -1 0 -1.5708
+      name "bottom_camera"
+      fieldOfView 1
+      width 240
+      height 240
+    }
     Receiver {
       channel 1
     }
