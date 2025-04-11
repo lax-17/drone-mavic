@@ -1,294 +1,367 @@
 from controller import Robot, GPS, InertialUnit, Gyro, Motor, Camera
 import cv2
 import numpy as np
-import math
 import time
 
-# --- Constants ---
+
 TIME_STEP = 32
 
+# --- TARGET CAR for Recognition (Bottom Cam) ---
+TARGET_CAR_NAME = b"targetCar" # <<< CONFIRM THIS EXACTLY MATCHES the car's 'name' field in Webots
+
 # Safety parameters
-MAX_SCAN_TIME = 30
-MAX_APPROACH_TIME = 30
-MAX_HOVER_LOW_TIME = 20
-MAX_LANDING_TIME = 35 # Increased slightly as it might hover waiting for detection
-EMERGENCY_STOP_AREA_THRESHOLD_FRONT = 0.5
-LANDED_ALTITUDE_THRESHOLD = 0.15
-ALTITUDE_TOLERANCE = 0.1
+MAX_SCAN_TIME = 30; MAX_APPROACH_TIME = 45; MAX_LANDING_TIME = 45 # Increased landing timeout slightly
+LANDED_ALTITUDE_THRESHOLD = 0.15; ALTITUDE_TOLERANCE = 0.1
+EMERGENCY_STOP_AREA_THRESHOLD_FRONT = 0.5 # Stop if target area > 50% in front view
 
 # Control gains
-K_VERTICAL_THRUST = 68.0
-K_VERTICAL_OFFSET = 0.6
-K_VERTICAL_P      = 3.0
-K_ROLL_P          = 15.0
-K_PITCH_P         = 15.0
+K_VERTICAL_THRUST = 68.0; K_VERTICAL_OFFSET = 0.6; K_VERTICAL_P = 3.0
+K_ROLL_P = 15.0; K_PITCH_P = 15.0
 
 # Altitude Targets
-TARGET_ALTITUDE = 3.0
-HOVER_LOW_ALTITUDE = 1.0
+TARGET_ALTITUDE = 3.0; LAND_HOLD_ALTITUDE = 1.0
 
-# --- Phase Specific Gains / Thresholds ---
-# Scan
-SCAN_YAW_GAIN      = 0.3; CENTERING_THRESHOLD = 50; SCAN_LOST_TARGET_YAW = 0.15
-# Approach
-APPROACH_YAW_GAIN  = 0.05; APPROACH_TILT = -0.15; APPROACH_AREA_SPEED_FACTOR = 0.8
-APPROACH_LOST_TARGET_FRAMES = 15; OVERHEAD_CENTERING_THRESHOLD = 25; OVERHEAD_PROXIMITY_AREA = 0.03
-# Hover Low
-HOVER_LOW_CENTERING_P = 0.01; HOVER_LOW_MAX_CORRECTION = 0.1;
-# Landing
-LANDING_THRUST_BASE = 55.0; LANDING_VERTICAL_P = 8.0; LANDING_CENTERING_P = 0.005
-LANDING_MAX_CORRECTION_TILT = 0.05; LAND_LOST_TARGET_FRAMES_TIMEOUT = 60 # Frames (~2s) to wait in land phase before reverting if target lost
 
-# Vision parameters
+SCAN_YAW_GAIN = 0.3; CENTERING_THRESHOLD = 50; SCAN_LOST_TARGET_YAW = 0.15
+# Approach (using OpenCV Front Cam)
+APPROACH_YAW_GAIN = 0.05; APPROACH_TILT = -0.15; APPROACH_AREA_SPEED_FACTOR = 0.8
+APPROACH_LOST_TARGET_FRAMES = 15
+# NEW Landing Trigger: Based on Area AND Vertical Position in Front Cam 
+LANDING_TRIGGER_AREA_THRESHOLD = 0.08 
+VERTICAL_POSITION_THRESHOLD = 0.8  
+# Landing (using Recognition Bottom Cam)
+LANDING_CENTERING_P = 0.008; LANDING_MAX_CORRECTION_TILT = 0.05
+# LANDING THRUST BASE !!! Lowered to encourage descent
+LANDING_THRUST_BASE = 45.0 # <<< WAS 55.0 - TUNE THIS if descent is too slow/fast
+LANDING_VERTICAL_P = 8.0;
+LAND_LOST_TARGET_FRAMES_TIMEOUT = 60; LANDING_CENTERING_THRESH = 15 # Not currently used, but kept
+
+# --- Vision Parameters for OpenCV (Front Cam) ---
 MIN_TARGET_SIZE = 50
-RED_HSV_RANGES = [((0, 70, 70), (10, 255, 255)), ((165, 70, 70), (180, 255, 255))]
+# !!! TUNE THESE RANGES FOR FRONT CAMERA VIEW !!!
+RED_HSV_RANGES = [((0, 100, 100), (10, 255, 255)), ((165, 100, 100), (180, 255, 255))]
 
-# --- State Tracking Class ---
-class DroneState: # (No changes from previous version)
-    def __init__(self):
-        self.phase = "takeoff"; self.target_found_front = False; self.target_found_bottom = False
-        self.target_lost_frames = 0; self.phase_start_time = time.time(); self.emergency_stop = False
-        self.active_camera_name = "camera"
-    def reset_phase_timer(self): self.phase_start_time = time.time()
-    def get_phase_duration(self): return time.time() - self.phase_start_time
-    def should_abort_phase(self):
-        duration = self.get_phase_duration()
-        phase_timeouts = {"scan": MAX_SCAN_TIME, "approach": MAX_APPROACH_TIME, "hover_low": MAX_HOVER_LOW_TIME, "land": MAX_LANDING_TIME}
-        if self.phase in phase_timeouts and duration > phase_timeouts[self.phase]:
-            print(f"⚠️ {self.phase.upper()} phase timeout ({duration:.1f}s > {phase_timeouts[self.phase]}s)")
-            if self.phase == "land": emergency_stop("Landing Timeout"); return True
-            else: return True # Signal other timeouts
+
+class DroneState: 
+    def __init__(self): self.phase="takeoff"; self.target_found_front=False; self.target_found_bottom=False; self.target_lost_frames=0; self.phase_start_time=time.time(); self.emergency_stop=False; self.active_camera_name="camera"
+    def reset_phase_timer(self): self.phase_start_time=time.time()
+    def get_phase_duration(self): return time.time()-self.phase_start_time
+    def should_abort_phase(self): 
+        duration = self.get_phase_duration(); timeouts = {"scan":MAX_SCAN_TIME,"approach":MAX_APPROACH_TIME,"land":MAX_LANDING_TIME}
+        if self.phase in timeouts and duration > timeouts[self.phase]:
+            print(f"{self.phase.upper()} Timeout");
+            if self.phase=="land": emergency_stop("Landing Timeout"); return True
+            else: return True
         return False
 
-# --- Robot Initialization ---
-# (No changes from previous version - ensure bottom_camera name is correct in your Webots world)
+
 robot = Robot(); state = DroneState()
-gps = robot.getDevice("drone_gps"); imu = robot.getDevice("drone_imu"); gyro = robot.getDevice("gyro")
-front_camera = robot.getDevice("camera")
+gps=robot.getDevice("drone_gps"); imu=robot.getDevice("drone_imu"); gyro=robot.getDevice("gyro")
+front_camera=robot.getDevice("camera")
 bottom_camera = None
 try:
-    bottom_camera_device = robot.getDevice("bottom_camera")
-    if bottom_camera_device: bottom_camera = bottom_camera_device; bottom_camera.enable(TIME_STEP); print("✅ Bottom camera initialized.")
-    else: print("❌ Bottom camera device seems invalid.")
-except Exception as e: print(f"❌ Error initializing bottom camera: {e}.")
-gps.enable(TIME_STEP); imu.enable(TIME_STEP); gyro.enable(TIME_STEP); front_camera.enable(TIME_STEP)
-motor_names = ["front left propeller", "front right propeller", "rear left propeller", "rear right propeller"]
-motors = [robot.getDevice(name) for name in motor_names];
-for m in motors: m.setPosition(float("inf")); m.setVelocity(0.0)
+    front_camera.enable(TIME_STEP); print("Front cam enabled (OpenCV).")
+    dev = robot.getDevice("bottom_camera");
+    if dev: bottom_camera=dev; bottom_camera.enable(TIME_STEP); print("Bottom cam init.")
+    if bottom_camera and bottom_camera.hasRecognition(): bottom_camera.recognitionEnable(TIME_STEP); print("Bottom cam Recognition enabled.")
+    elif bottom_camera: print("⚠Bottom cam has NO Recognition node!")
+    else: print(" Bottom cam not found/invalid.")
+    
+except Exception as e: print(f"Camera init error: {e}")
 
-# --- OpenCV Windows ---
+gps.enable(TIME_STEP); imu.enable(TIME_STEP); gyro.enable(TIME_STEP)
+motor_names = ["front left propeller","front right propeller","rear left propeller","rear right propeller"]
+motors = [];
+try:
+    motors = [robot.getDevice(name) for name in motor_names];
+    if None in motors: raise ValueError(f"Motors not found: {[motor_names[i] for i,m in enumerate(motors) if m is None]}")
+    for m in motors: m.setPosition(float("inf")); m.setVelocity(0.0);
+    print("Motors initialized.")
+except Exception as e: print(f"MOTOR INIT FAILED: {e}"); state.emergency_stop = True
+
+
 cv2.namedWindow("Camera View", cv2.WINDOW_NORMAL)
-# cv2.namedWindow("Bottom Cam Mask", cv2.WINDOW_NORMAL) # Optional debug window
 
-# --- Helper Functions ---
-# (No changes from previous version for clamp, emergency_stop, land_complete, detect_red_target, process_camera_image)
-def clamp(value, min_val, max_val): return max(min_val, min(value, max_val))
-def emergency_stop(reason=""):
-    global state;
-    if not state.emergency_stop: print(f"⚠️ EMERGENCY STOP: {reason}"); state.emergency_stop = True
-    for m in motors: m.setVelocity(0.0)
-def land_complete(): print("✅ Landing complete."); emergency_stop("Landed")
-def detect_red_target(image_bgr, min_area, active_camera_name): # Pass name for debug
-    try: # Simplified for brevity - keep full error handling from previous code
-        if image_bgr is None: return False, 0, 0, 0, None
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for (lower, upper) in RED_HSV_RANGES: mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
-        # --- Optional Conditional Mask Display ---
-        # if active_camera_name == (bottom_camera.getName() if bottom_camera else "none"): cv2.imshow("Bottom Cam Mask", mask)
-        # else: if cv2.getWindowProperty("Bottom Cam Mask", 0) >= 0: cv2.destroyWindow("Bottom Cam Mask")
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return False, 0, 0, 0, None
-        largest_contour = max(contours, key=cv2.contourArea); area = cv2.contourArea(largest_contour)
-        if area > min_area: x, y, w, h = cv2.boundingRect(largest_contour); return True, x + w // 2, y + h // 2, area, (x, y, x + w, y + h)
-        else: return False, 0, 0, area, None
-    except Exception as e: print(f"Detect Error: {e}"); return False, 0, 0, 0, None
-def process_camera_image(camera_device, active_camera_name): # Pass name
-    global state;
-    if camera_device is None: return None, None, False, 0, 0, 0, None
-    img_data = camera_device.getImage(); w = camera_device.getWidth(); h = camera_device.getHeight()
-    if not img_data or w <= 0 or h <= 0: return None, None, False, 0, 0, 0, None
-    try: # Simplified - keep full error handling/drawing from previous
-        bgr_img = cv2.cvtColor(np.frombuffer(img_data, np.uint8).reshape((h, w, 4)), cv2.COLOR_BGRA2BGR)
-        debug_img = bgr_img.copy()
-        found, cx, cy, area, bbox = detect_red_target(bgr_img, MIN_TARGET_SIZE, active_camera_name) # Pass name
-        # Drawing code omitted for brevity - keep from previous version
-        if found and bbox: x1, y1, x2, y2 = bbox; cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0,0,255), 1); cv2.circle(debug_img, (cx,cy), 3, (255,0,0), -1)
-        cv2.putText(debug_img, f"P:{state.phase} C:{active_camera_name}", (5,15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
-        cv2.imshow("Camera View", debug_img)
-        return bgr_img, debug_img, found, cx, cy, area, bbox
-    except Exception as e: print(f"Process Img Err: {e}"); return None, None, False, 0, 0, 0, None
 
-# --- Main Control Loop ---
-print("Starting drone control loop...")
+def clamp(v, mn, mx): return max(mn, min(v, mx))
+def emergency_stop(reason=""): global state; state.emergency_stop=True; print(f"\n⚠EMERGENCY STOP: {reason}"); [m.setVelocity(0.0) for m in motors if m is not None]
+def land_complete(): print("\n Landed Successfully."); emergency_stop("Landed")
+def detect_red_target_opencv(img, min_area): # Keep full function
+    try:
+        if img is None: return False,0,0,0,None
+        hsv=cv2.cvtColor(img,cv2.COLOR_BGR2HSV); mask=np.zeros(hsv.shape[:2],dtype=np.uint8)
+        for(l,u) in RED_HSV_RANGES: mask|=cv2.inRange(hsv,np.array(l),np.array(u))
+        cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE);
+        if not cnts: return False,0,0,0,None
+        c=max(cnts,key=cv2.contourArea); area=cv2.contourArea(c);
+        if area>min_area: x,y,w,h=cv2.boundingRect(c); return True,x+w//2,y+h//2,area,(x,y,x+w,y+h)
+        else: return False,0,0,area,None
+    except Exception as e: print(f"OpenCV Detect Err: {e}"); return False,0,0,0,None
+
+def check_recognition_bottom(camera): # Keep full function
+    if not camera or not camera.hasRecognition() or camera.getRecognitionNumberOfObjects() == 0: return False, 0, 0, (0, 0)
+    objects = camera.getRecognitionObjects();
+    for obj in objects:
+
+        if obj.getModel() == TARGET_CAR_NAME.decode('utf-8'):
+            pos = obj.getPositionOnImage(); size = obj.getSizeOnImage();
+            px = int(round(pos[0])); py = int(round(pos[1]))
+            sx = int(round(size[0])); sy = int(round(size[1]))
+            return True, px, py, (sx, sy)
+    return False, 0, 0, (0, 0)
+
+def display_camera_feed(cam_dev, cam_name, found, cx, cy, area_or_size, bbox): # Keep full function
+    global state, altitude;
+    if cam_dev is None: return
+    img_data = cam_dev.getImage(); w = cam_dev.getWidth(); h = cam_dev.getHeight()
+    if not img_data or w<=0 or h<=0: return
+    try:
+        img_array = np.frombuffer(img_data, np.uint8).reshape((h, w, 4))
+        bgr_img = cv2.cvtColor(img_array, cv2.COLOR_BGRA2BGR)
+        dbg_img = bgr_img.copy()
+
+
+        if found:
+            if bbox:
+                x1,y1,x2,y2 = bbox
+                cv2.rectangle(dbg_img, (x1,y1), (x2,y2), (0,0,255), 2) # Red box
+                cv2.putText(dbg_img, f"Area:{area_or_size:.0f}", (x1,y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1) # Green text
+                cv2.circle(dbg_img, (cx,cy), 5, (255,0,0), -1) # Blue center dot
+            elif isinstance(area_or_size, tuple) and len(area_or_size)==2: # From Recognition (Bottom Cam)
+                px_w, px_h = area_or_size
+                cx_int, cy_int = int(cx), int(cy)
+                x1, y1 = cx_int - px_w // 2, cy_int - px_h // 2
+                x2, y2 = cx_int + px_w // 2, cy_int + px_h // 2
+                cv2.rectangle(dbg_img, (x1, y1), (x2, y2), (0, 255, 255), 2) # Yellow box for recognition
+                cv2.putText(dbg_img, f"Size:{px_w}x{px_h}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1) # Yellow text
+                cv2.circle(dbg_img, (cx_int, cy_int), 5, (255, 0, 0), -1) # Blue center dot
+
+        cv2.line(dbg_img,(w//2,h//2-10),(w//2,h//2+10),(0,255,255),1); cv2.line(dbg_img,(w//2-10,h//2),(w//2+10,h//2),(0,255,255),1)
+        cv2.putText(dbg_img,f"P:{state.phase} C:{cam_name}",(5,15),cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,0),1); cv2.putText(dbg_img,f"Alt:{altitude:.2f}", (w-70, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
+        cv2.imshow("Camera View", dbg_img);
+    except Exception as e: print(f"Display Err: {e}")
+
+
+print("Starting drone (Hybrid + Area/Position Trigger)..."); last_phase = ""; altitude = 0.0
 while robot.step(TIME_STEP) != -1 and not state.emergency_stop:
     try:
-        # --- 1. Read Sensors ---
         roll, pitch, yaw = imu.getRollPitchYaw(); altitude = gps.getValues()[2]
         roll_rate, pitch_rate, yaw_rate = gyro.getValues()
 
-        # --- 2. Safety & Timeout Checks ---
-        if abs(roll) > 0.8 or abs(pitch) > 0.8: emergency_stop("Extreme angles"); continue
-        if altitude < -0.1 : emergency_stop("Below ground"); continue
-        if not state.emergency_stop and state.should_abort_phase():
-            if not state.emergency_stop: print(f"Timeout -> SCAN"); state.phase = "scan"; state.reset_phase_timer(); state.target_lost_frames = 0
+        if abs(roll)>0.8 or abs(pitch)>0.8: emergency_stop("Excessive Roll/Pitch"); continue
+        if altitude < -0.2 : emergency_stop("Below Ground"); continue # Slightly more tolerance
+        if state.phase != last_phase:
+            print(f"\n--- Phase Change: {last_phase.upper()} -> {state.phase.upper()} ---")
+            last_phase = state.phase
 
-        # --- 3. Determine Target Altitude (used by standard PID) ---
+        if state.should_abort_phase():
+             # If timeout occurred in any phase other than landing, go back to scanning
+             if state.phase != "land" and not state.emergency_stop:
+                 print(f"Phase Timeout -> Reverting to SCAN")
+                 state.phase = "scan"
+                 state.reset_phase_timer()
+                 state.target_lost_frames = 0
+             # If landing timed out, emergency_stop is already called by should_abort_phase
+             continue
+
+        #  Determine Target Altitude
+        # Default to target cruising altitude
         current_target_altitude = TARGET_ALTITUDE
-        if state.phase == "hover_low" or (state.phase == "land" and not state.target_found_bottom): # Also use 1m target in land phase if target lost
-             current_target_altitude = HOVER_LOW_ALTITUDE
+        if state.phase == "land" and not state.target_found_bottom:
+            current_target_altitude = LAND_HOLD_ALTITUDE
 
-        # --- 4. Common PID Calculations ---
-        # Altitude PID based on current target (used if not in landing descent)
+        # Common PID Calculations
+        # Altitude control (always active, but thrust overridden in landing descent)
         clamped_diff_alt = clamp(current_target_altitude - altitude + K_VERTICAL_OFFSET, -1.0, 1.0)
         vertical_input_pid = K_VERTICAL_P * (clamped_diff_alt ** 3)
-        # Base stabilization
-        roll_clamped = clamp(roll, -0.5, 0.5); pitch_clamped = clamp(pitch, -0.5, 0.5)
-        roll_stabilization = K_ROLL_P * roll_clamped + roll_rate
-        pitch_stabilization = K_PITCH_P * pitch_clamped + pitch_rate
+        # Stabilization
+        roll_clamped=clamp(roll,-0.5,0.5); pitch_clamped=clamp(pitch,-0.5,0.5)
+        roll_stabilization=K_ROLL_P*roll_clamped+roll_rate; pitch_stabilization=K_PITCH_P*pitch_clamped+pitch_rate
 
-        # --- 5. Default Input Values ---
-        vertical_thrust = K_VERTICAL_THRUST + vertical_input_pid # Default for non-landing-descent
-        roll_input = roll_stabilization; pitch_input = pitch_stabilization; yaw_input = 0.0
+        #Default Input Values
+        # Start with altitude hold + stabilization
+        vertical_thrust = K_VERTICAL_THRUST + vertical_input_pid
+        roll_input = roll_stabilization
+        pitch_input = pitch_stabilization
+        yaw_input = 0.0 # Yaw is controlled per-phase
 
-        # --- 6. FSM: Camera Selection ---
-        current_camera = front_camera; state.active_camera_name = front_camera.getName() # Default front
-        if state.phase == "land" and bottom_camera: # Land phase ALWAYS tries to use bottom cam
-            current_camera = bottom_camera; state.active_camera_name = bottom_camera.getName()
+        # --- FSM: Camera Selection ---
+        current_camera = front_camera
+        state.active_camera_name = front_camera.getName()
+        
+        if state.phase == "land" and bottom_camera:
+            current_camera = bottom_camera
+            state.active_camera_name = bottom_camera.getName()
 
-        # --- 7. FSM: Image Processing ---
-        bgr_img, debug_img, found, cx, cy, area, bbox = process_camera_image(current_camera, state.active_camera_name)
-        cam_w, cam_h = (current_camera.getWidth(), current_camera.getHeight()) if current_camera else (0, 0)
-        # Update target found status (check camera name)
-        if bgr_img is not None and current_camera:
-             is_front = current_camera.getName() == front_camera.getName()
-             is_bottom = bottom_camera and current_camera.getName() == bottom_camera.getName()
-             if is_front: state.target_found_front = found
-             if is_bottom: state.target_found_bottom = found
-        else: found = False; state.target_found_front = False; state.target_found_bottom = False; cx,cy,area,bbox=0,0,0,None
+        found, cx, cy, area_or_size, bbox = False, 0, 0, 0, None
+        relative_area = 0.0
+        cam_w = current_camera.getWidth() if current_camera else 0 
+        cam_h = current_camera.getHeight() if current_camera else 0
 
-        # --- 8. FSM: Phase Logic ---
+        # Process image based on the active camera
+        if current_camera == front_camera and cam_w > 0 and cam_h > 0:
+            img_data=current_camera.getImage()
+            if img_data:
+                bgr_img = cv2.cvtColor(np.frombuffer(img_data, np.uint8).reshape((cam_h, cam_w, 4)), cv2.COLOR_BGRA2BGR)
+                found, cx, cy, area, bbox = detect_red_target_opencv(bgr_img, MIN_TARGET_SIZE)
+                state.target_found_front = found
+                if found: relative_area = area / (cam_w * cam_h) 
+            else:
+                state.target_found_front = False; found = False
+            display_camera_feed(current_camera, state.active_camera_name, found, cx, cy, area if found else 0, bbox)
 
-        if state.phase == "takeoff": # Target TARGET_ALTITUDE
-             if altitude >= TARGET_ALTITUDE - ALTITUDE_TOLERANCE: print("-> SCAN"); state.phase = "scan"; state.reset_phase_timer(); state.target_lost_frames = 0
-             # Uses default thrust & stabilization from step 5
+        elif current_camera == bottom_camera and cam_w > 0 and cam_h > 0:
+            found, cx, cy, size_px = check_recognition_bottom(current_camera)
+            state.target_found_bottom = found; area_or_size = size_px
+            display_camera_feed(current_camera, state.active_camera_name, found, cx, cy, area_or_size, None)
 
-        elif state.phase == "scan": # Target TARGET_ALTITUDE, add yaw
-             if state.target_found_front:
-                  state.target_lost_frames = 0; offset_x = cx - (cam_w // 2)
-                  if abs(offset_x) < CENTERING_THRESHOLD: print("-> APPROACH"); state.phase = "approach"; state.reset_phase_timer(); state.target_lost_frames = 0
-                  else: yaw_input = clamp(-SCAN_YAW_GAIN * (offset_x / (cam_w // 2)), -0.5, 0.5)
-             else:
-                  state.target_lost_frames += 1
-                  if state.target_lost_frames > 5: yaw_input = SCAN_LOST_TARGET_YAW
-             # Uses default thrust & stabilization
+        else:
+            state.target_found_front=False; state.target_found_bottom=False; found = False
 
-        elif state.phase == "approach": # Target TARGET_ALTITUDE, move forward
-             if state.target_found_front:
-                  state.target_lost_frames = 0; offset_x = cx - (cam_w // 2)
-                  relative_area = area / (cam_w * cam_h) if (cam_w * cam_h) > 0 else 0
-                  is_centered = abs(offset_x) < OVERHEAD_CENTERING_THRESHOLD
-                  is_close = relative_area > OVERHEAD_PROXIMITY_AREA
-                  # Check 1: Switch to HOVER_LOW
-                  if is_centered and is_close: print("-> HOVER_LOW"); state.phase = "hover_low"; state.reset_phase_timer(); state.target_lost_frames = 0; continue
-                  # Check 2: Emergency Stop
-                  elif relative_area > EMERGENCY_STOP_AREA_THRESHOLD_FRONT: print("! STOP (Area)"); emergency_stop(f"Front area {relative_area:.2%}"); continue
-                  # Check 3: Continue Approach
-                  else:
-                       speed_scale = relative_area / OVERHEAD_PROXIMITY_AREA if OVERHEAD_PROXIMITY_AREA > 0 else 1.0
-                       area_factor = 1.0 - min(speed_scale, APPROACH_AREA_SPEED_FACTOR)
-                       forward_tilt = APPROACH_TILT * area_factor
-                       pitch_input = pitch_stabilization + K_PITCH_P * clamp(forward_tilt, -0.3, 0.0)
-                       yaw_input = clamp(-APPROACH_YAW_GAIN * (offset_x / (cam_w // 2)), -0.3, 0.3)
-             else: # Target lost
-                  state.target_lost_frames += 1
-                  if state.target_lost_frames > APPROACH_LOST_TARGET_FRAMES: print("! Lost -> SCAN"); state.phase = "scan"; state.reset_phase_timer()
-             # Uses default thrust & roll
 
-        elif state.phase == "hover_low": # Target HOVER_LOW_ALTITUDE, use front cam
-             # Uses default thrust (PID to 1m) and stabilization
-             print(f"[HOVER_LOW] Alt:{altitude:.2f}/{HOVER_LOW_ALTITUDE:.1f} ", end="")
-             if state.target_found_front:
-                  state.target_lost_frames = 0; offset_x = cx - (cam_w // 2); offset_y = cy - (cam_h // 2)
-                  # Fine centering
-                  yaw_input = clamp(-APPROACH_YAW_GAIN * offset_x/(cam_w//2), -0.2, 0.2) # Fine yaw
-                  pitch_correction = clamp(-HOVER_LOW_CENTERING_P * offset_y, -HOVER_LOW_MAX_CORRECTION, HOVER_LOW_MAX_CORRECTION)
-                  pitch_input += K_PITCH_P * pitch_correction # Add correction
-                  print(f"Center(X:{offset_x},Y:{offset_y}) ", end="")
-                  # Check transition to LAND
-                  alt_ok = abs(altitude - HOVER_LOW_ALTITUDE) < ALTITUDE_TOLERANCE
-                  center_ok = abs(offset_x) < OVERHEAD_CENTERING_THRESHOLD # Check centering
-                  if alt_ok and center_ok:
-                       print("-> LAND")
-                       if bottom_camera: state.phase = "land"; state.reset_phase_timer(); state.target_lost_frames = 0; continue
-                       else: print("! No Btm Cam"); emergency_stop("No bottom cam"); continue
-                  else: print(f"Stblz(AltOK:{alt_ok},CtrOK:{center_ok})")
-             else: # Target lost
-                  state.target_lost_frames += 1; print(f"Lost({state.target_lost_frames})", end="")
-                  if state.target_lost_frames > APPROACH_LOST_TARGET_FRAMES: print("! Lost -> SCAN"); state.phase = "scan"; state.reset_phase_timer()
-                  print("") # Newline after status print
+        # --- Phase Logic ---
+        print(f"Phase: {state.phase} | Alt: {altitude:.2f} | Target Alt: {current_target_altitude:.1f} | ", end="") # Common log prefix
 
-        # ===========================================================
-        # MODIFIED LAND PHASE LOGIC
-        # ===========================================================
+        if state.phase == "takeoff":
+            print(f"Climbing...", end="\r")
+            # Target altitude check
+            if altitude >= TARGET_ALTITUDE - ALTITUDE_TOLERANCE:
+                print("\nReached target altitude.")
+                state.phase="scan"; state.reset_phase_timer(); state.target_lost_frames=0
+
+        elif state.phase == "scan": # Uses OpenCV Front Cam
+            if state.target_found_front:
+                 state.target_lost_frames=0; off_x=cx-(cam_w//2);
+                 print(f"Target Found [F]: OffX:{off_x} | ", end="")
+                 # Check if centered enough
+                 if abs(off_x) < CENTERING_THRESHOLD:
+                     print("Centered -> Approach")
+                     state.phase="approach"; state.reset_phase_timer(); state.target_lost_frames=0
+                 else: # Not centered, apply yaw correction
+                     yaw_input = clamp(-SCAN_YAW_GAIN*off_x/(cam_w//2), -0.5, 0.5)
+                     print(f"YawIn:{yaw_input:.2f}", end="\r")
+            else: # Target not found
+                 state.target_lost_frames+=1;
+                 print(f"Searching... Lost Frames:{state.target_lost_frames} | ", end="")
+                 # Rotate to search if lost for a few frames
+                 if state.target_lost_frames > 5: # Start rotating after 5 frames lost
+                     yaw_input = SCAN_LOST_TARGET_YAW;
+                     print(f"Rotating:{yaw_input:.2f}", end="\r")
+                 else: # Wait briefly before rotating
+                     print("Holding...", end="\r")
+
+
+        elif state.phase == "approach": # Uses OpenCV Front Cam
+            if state.target_found_front and cam_h > 0 and cam_w > 0: # Ensure cam dims valid
+                state.target_lost_frames=0; off_x=cx-(cam_w//2);
+                # Check landing trigger conditions
+                is_close_enough_area = relative_area > LANDING_TRIGGER_AREA_THRESHOLD
+                is_low_in_view = cy > cam_h * VERTICAL_POSITION_THRESHOLD 
+
+                print(f"Target Found [F]: Area:{relative_area:.3f} (>{LANDING_TRIGGER_AREA_THRESHOLD:.3f}?) | "
+                      f"VPos:{cy/cam_h:.2f} (>{VERTICAL_POSITION_THRESHOLD:.1f}?) | OffX:{off_x} -> ", end="")
+
+            
+                if is_close_enough_area and is_low_in_view:
+                    print("CLOSE & LOW -> LAND")
+                    if bottom_camera and bottom_camera.hasRecognition():
+                        state.phase="land"; state.reset_phase_timer(); state.target_lost_frames=0;
+                        continue 
+                    else:
+                        print("! No Bottom Cam w/ Recog for Landing!"); emergency_stop("No Btm Cam for Land"); continue
+                elif relative_area > EMERGENCY_STOP_AREA_THRESHOLD_FRONT:
+                    print("! STOP (Too Close)"); emergency_stop(f"Front Area Exceeded {relative_area:.2%}"); continue
+                else:
+                    print("Approaching...")
+                    speed_scale = relative_area / LANDING_TRIGGER_AREA_THRESHOLD if LANDING_TRIGGER_AREA_THRESHOLD > 0 else 1.0
+                    approach_factor = 1.0 - min(speed_scale, APPROACH_AREA_SPEED_FACTOR) 
+                    forward_tilt = APPROACH_TILT * approach_factor
+                    # Apply pitch for forward movement and yaw for centering
+                    pitch_input += K_PITCH_P * clamp(forward_tilt, -0.4, 0.0)
+                    yaw_input = clamp(-APPROACH_YAW_GAIN * off_x / (cam_w // 2), -0.3, 0.3) 
+                    print(f" Tilt:{forward_tilt:.2f} YawIn:{yaw_input:.2f}", end="\r")
+
+            else:
+                state.target_lost_frames += 1;
+                print(f"Target Lost ({state.target_lost_frames}/{APPROACH_LOST_TARGET_FRAMES})", end="\r")
+                if state.target_lost_frames > APPROACH_LOST_TARGET_FRAMES:
+                    print("\n! Lost target during approach -> Reverting to SCAN")
+                    state.phase = "scan"; state.reset_phase_timer()
+
         elif state.phase == "land":
-             # Always uses bottom camera (selected in step 6)
-             if not bottom_camera: print("! LAND No Btm Cam -> SCAN"); state.phase = "scan"; state.reset_phase_timer(); continue
+            if not bottom_camera:
+                print("! LANDING ABORTED - No Bottom Cam -> SCAN"); state.phase = "scan"; state.reset_phase_timer(); continue
 
-             log_msg = f"[LAND] Alt:{altitude:.2f} "
-             # --- Check if bottom camera sees target ---
-             if state.target_found_bottom:
-                  # --- TARGET FOUND: Perform Landing Descent & Centering ---
-                  state.target_lost_frames = 0
-                  # Calculate landing thrust (decays with altitude)
-                  vertical_thrust = clamp(LANDING_THRUST_BASE + LANDING_VERTICAL_P * altitude, 0, K_VERTICAL_THRUST * 1.1)
-                  # Calculate centering corrections based on bottom camera
-                  offset_x = cx - (cam_w // 2); offset_y = cy - (cam_h // 2)
-                  roll_correction = clamp(LANDING_CENTERING_P * offset_x, -LANDING_MAX_CORRECTION_TILT, LANDING_MAX_CORRECTION_TILT)
-                  pitch_correction = clamp(-LANDING_CENTERING_P * offset_y, -LANDING_MAX_CORRECTION_TILT, LANDING_MAX_CORRECTION_TILT)
-                  # Add corrections to stabilization inputs
-                  roll_input = roll_stabilization + K_ROLL_P * roll_correction
-                  pitch_input = pitch_stabilization + K_PITCH_P * pitch_correction
-                  yaw_input = 0 # Keep heading stable
-                  log_msg += f"Target Found: Descending... Offs({offset_x},{offset_y})"
+            if state.target_found_bottom and cam_w > 0 and cam_h > 0: # Target Found via Recognition
+                state.target_lost_frames = 0
+                
+                #Calculate Descent Thrust 
+                calculated_thrust = LANDING_THRUST_BASE + LANDING_VERTICAL_P * altitude
+                vertical_thrust = clamp(calculated_thrust, 0, K_VERTICAL_THRUST * 1.1) # Descent Thrust
+                #Calculate Centering Corrections 
+                offset_x = cx - cam_w // 2; offset_y = cy - cam_h // 2
+                roll_correction = clamp(LANDING_CENTERING_P * offset_x, -LANDING_MAX_CORRECTION_TILT, LANDING_MAX_CORRECTION_TILT)
+                
+                # Check pitch sign: If target Y > center Y (target lower on screen), want positive pitch offset? Depends on IMU frame. Assuming (-) makes drone pitch *down* towards target.
+                pitch_correction = clamp(-LANDING_CENTERING_P * offset_y, -LANDING_MAX_CORRECTION_TILT, LANDING_MAX_CORRECTION_TILT) # Adjust sign if needed based on testing
+                # --- Apply Corrections ---
+                roll_input = roll_stabilization + K_ROLL_P * roll_correction # Add centering correction
+                pitch_input = pitch_stabilization + K_PITCH_P * pitch_correction # Add centering correction
+                yaw_input = 0 # No yaw during final descent
 
-             else:
-                  # --- TARGET NOT FOUND: Hold Altitude at ~1m ---
-                  state.target_lost_frames += 1
-                  # Use standard PID to hold HOVER_LOW_ALTITUDE (uses vertical_input_pid calculated in step 4 based on current_target_altitude)
-                  vertical_thrust = K_VERTICAL_THRUST + vertical_input_pid
-                  # Use stabilization only, no centering correction
-                  roll_input = roll_stabilization
-                  pitch_input = pitch_stabilization
-                  yaw_input = 0
-                  log_msg += f"Target Lost({state.target_lost_frames}): Holding Alt @ {HOVER_LOW_ALTITUDE:.1f}m"
-                  # Optional: Revert to scan if target lost for too long while trying to land
-                  if state.target_lost_frames > LAND_LOST_TARGET_FRAMES_TIMEOUT:
-                       print("! Lost Target too long in LAND -> SCAN")
-                       state.phase = "scan"; state.reset_phase_timer()
-                       continue
+                print(f"Target Found [R]: Descending... Off(X:{offset_x},Y:{offset_y}) | "
+                      f"Thrust Calc:{calculated_thrust:.1f}->{vertical_thrust:.1f}", end="\r") 
 
-             print(log_msg)
-             # Check if physically landed (only possible if descending)
-             if altitude < LANDED_ALTITUDE_THRESHOLD:
-                  land_complete(); continue
-        # ===========================================================
-        # END OF MODIFIED LAND PHASE
-        # ===========================================================
+                if altitude < LANDED_ALTITUDE_THRESHOLD:
+                    land_complete(); continue
 
-        # --- 9. Final Motor Commands ---
+            else: 
+                state.target_lost_frames += 1
+                roll_input = roll_stabilization; pitch_input = pitch_stabilization; yaw_input = 0
+
+                print(f"Target Lost [R]({state.target_lost_frames}/{LAND_LOST_TARGET_FRAMES_TIMEOUT}): Holding Alt @ {LAND_HOLD_ALTITUDE:.1f}m", end="\r")
+
+                # If lost for too long during landing, abort and rescan
+                if state.target_lost_frames > LAND_LOST_TARGET_FRAMES_TIMEOUT:
+                    print("\n! Lost Target too long during landing -> Reverting to SCAN")
+                    state.phase = "scan"; state.reset_phase_timer(); continue
+
+
         if not state.emergency_stop:
-            FL = vertical_thrust - roll_input + pitch_input - yaw_input; FR = vertical_thrust + roll_input + pitch_input + yaw_input
-            RL = vertical_thrust - roll_input - pitch_input + yaw_input; RR = vertical_thrust + roll_input - pitch_input - yaw_input
-            motors[0].setVelocity(FL); motors[1].setVelocity(-FR); motors[2].setVelocity(-RL); motors[3].setVelocity(RR)
+            m1_speed = vertical_thrust - roll_input + pitch_input - yaw_input # Front Left
+            m2_speed = vertical_thrust + roll_input + pitch_input + yaw_input # Front Right
+            m3_speed = vertical_thrust - roll_input - pitch_input + yaw_input # Rear Left
+            m4_speed = vertical_thrust + roll_input - pitch_input - yaw_input # Rear Right
 
-        # --- 10. OpenCV Window Update ---
-        if cv2.waitKey(1) & 0xFF == ord('q'): print("User exit."); break
+            if motors and all(motors):
+                motors[0].setVelocity(m1_speed)    # Front Left
+                motors[1].setVelocity(-m2_speed)   # Front Right (Often reversed)
+                motors[2].setVelocity(-m3_speed)   # Rear Left   (Often reversed)
+                motors[3].setVelocity(m4_speed)    # Rear Right
+            elif not state.emergency_stop: # Prevent error spam after stop
+                 print("ERROR: Motors invalid or not initialized!")
+                 emergency_stop("Motor Failure")
 
-    # --- Error Handling ---
-    except Exception as e: print(f"\n❌ MAIN LOOP ERROR: {e} ❌"); import traceback; traceback.print_exc(); emergency_stop("Loop Exception"); break
+        # OpenCV Update
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == 27:
+            print("\nUser requested exit.")
+            emergency_stop("User Exit")
+            break
 
-# --- Cleanup ---
-print("Simulation ended.");
-if not state.emergency_stop: emergency_stop("End script")
+    except Exception as e:
+        print(f"\n❌ MAIN LOOP ERROR: {e} ❌")
+        import traceback
+        traceback.print_exc()
+        emergency_stop("Loop Exception")
+        break
+
+
+print("\nSimulation loop finished or stopped.")
+if not state.emergency_stop: 
+    emergency_stop("Script End")
+
 cv2.destroyAllWindows()
+print("OpenCV windows closed.")
+
+print("Script finished.")

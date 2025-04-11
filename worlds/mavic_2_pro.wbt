@@ -160,12 +160,14 @@ Robot {
   rotation 0.034863928111084644 6.510931954065678e-07 0.9993920684677466 -3.1415873782344224
   children [
     Camera {
-      translation 0 0 -0.05
+      translation 0.05 0 -0.05
       rotation 0 -1 0 -1.5708
       name "bottom_camera"
       fieldOfView 1
       width 240
       height 240
+      recognition Recognition {
+      }
     }
     Receiver {
       channel 1
